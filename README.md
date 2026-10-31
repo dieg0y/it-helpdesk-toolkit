@@ -78,8 +78,8 @@ MIT (solo cubre el código de este repo, no las herramientas que descarga). Ver 
 
 ## 🤖 Aviso sobre el uso de IA
 
-Este proyecto se desarrolló con ayuda de inteligencia artificial (Claude, de Anthropic), que colaboró en la revisión, mejora y documentación del código. El autor es quien lo dirige, lo prueba y se hace responsable del repositorio. Como con cualquier script, revisa el código antes de ejecutarlo y pruébalo primero en un entorno seguro.
+Este proyecto se desarrolló con ayuda de inteligencia artificial , que colaboró en la revisión, mejora y documentación del código.
 
 ---
 
-Hecho por [@dieg0y](https://github.com/dieg0y). Si te sirvió, deja una ⭐ al repo.
+Hecho por [@dieg0y](https://github.com/dieg0y).
