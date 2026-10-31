@@ -12,8 +12,8 @@ Remoto, VPN, antivirus, reparación de Windows, diagnóstico de red, inventario 
 ## 🚀 Cómo usarlo
 
 ```powershell
-git clone https://github.com/<tu-usuario>/<tu-repositorio>.git
-cd <tu-repositorio>
+git clone https://github.com/dieg0y/it-helpdesk-toolkit.git
+cd it-helpdesk-toolkit
 powershell -ExecutionPolicy Bypass -File .\Deploy-IT-Toolkit.ps1
 ```
 
@@ -75,3 +75,7 @@ Cada módulo tiene su propio manual, tipo `man`. En el menú escribe **`M` + nú
 ## 📄 Licencia
 
 MIT (solo cubre el código de este repo, no las herramientas que descarga). Ver [`LICENSE`](LICENSE).
+
+---
+
+Hecho por [@dieg0y](https://github.com/dieg0y). Si te sirvió, deja una ⭐ al repo.
