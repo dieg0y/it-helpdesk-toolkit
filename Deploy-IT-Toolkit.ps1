@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Deploy-IT-Toolkit.ps1 v5 - Despliegue del IT Helpdesk Toolkit.
+    Deploy-IT-Toolkit.ps1 v6 - Despliegue del IT Helpdesk Toolkit.
 
 .DESCRIPTION
     Crea la estructura de carpetas, genera los scripts de soporte y los manuales,
@@ -248,7 +248,7 @@ function Optimize-Sysinternals {
 
 # ----------------------------------------------------------------------
 Write-Status '=======================================================================' 'Step'
-Write-Status '   DESPLEGANDO IT HELPDESK TOOLKIT v5                                  ' 'Step'
+Write-Status '   DESPLEGANDO IT HELPDESK TOOLKIT v6                                  ' 'Step'
 Write-Status '=======================================================================' 'Step'
 Write-Status " Destino: $ToolkitRoot"
 
@@ -265,7 +265,8 @@ $Folders = @(
     '05_PC_Troubleshooting/Sysinternals',
     '06_Network_Repair',
     '07_Audit_Inventory/ShowKeyPlus',
-    '08_Uninstall_Reset'
+    '08_Uninstall_Reset',
+    '09_Power_Tune'
 )
 foreach ($folder in $Folders) {
     $path = Join-Path $ToolkitRoot $folder
@@ -280,6 +281,248 @@ Write-Status ' -> Estructura lista.' 'Ok'
 # 2. SCRIPTS DE SOPORTE
 # ----------------------------------------------------------------------
 Write-Status "`n[2/4] Generando scripts de soporte..." 'Warn'
+
+# ---------- Toolkit-SystemChange.psm1 ----------
+$SystemChangeContent = @'
+Set-StrictMode -Version 1.0
+
+function Write-ToolkitLog {
+    param([Parameter(Mandatory)][string]$Message)
+    $root = $PSScriptRoot
+    $logDir = Join-Path $root '05_PC_Troubleshooting\Logs'
+    try {
+        if (-not (Test-Path -LiteralPath $logDir)) { [void](New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop) }
+        $logPath = Join-Path $logDir ('IT-Toolkit_{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+        Add-Content -LiteralPath $logPath -Value ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        $fallbackDir = Join-Path $env:ProgramData 'IT-Helpdesk-Toolkit\Logs'
+        try {
+            if (-not (Test-Path -LiteralPath $fallbackDir)) { [void](New-Item -ItemType Directory -Path $fallbackDir -Force -ErrorAction Stop) }
+            $logPath = Join-Path $fallbackDir ('IT-Toolkit_{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+            Add-Content -LiteralPath $logPath -Value ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) -Encoding UTF8 -ErrorAction Stop
+        } catch { throw "No se pudo escribir el log del toolkit: $($_.Exception.Message)" }
+    }
+}
+
+function Confirm-ToolkitDialog {
+    param([Parameter(Mandatory)][string]$Message, [string]$Title = 'IT Helpdesk Toolkit')
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        $Message, $Title,
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    return ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
+function Invoke-ToolkitSystemChange {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Operation,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) { throw 'Esta operacion requiere privilegios de Administrador.' }
+    if (-not (Confirm-ToolkitDialog -Title 'Confirmar cambio del sistema' -Message "$Description`n`n¿Deseas continuar?")) {
+        Write-ToolkitLog "CANCELADO: $Operation (el tecnico rechazo la confirmacion)."
+        return $false
+    }
+
+    Write-ToolkitLog "Inicio: $Operation."
+    try {
+        Checkpoint-Computer -Description "Pre-Optimization-IT-Toolkit" -RestorePointType "MODIFY_SETTINGS"
+        Write-ToolkitLog 'Punto de restauracion creado: Pre-Optimization-IT-Toolkit.'
+    } catch {
+        $checkpointError = $_.Exception.Message
+        Write-ToolkitLog "ADVERTENCIA: no se pudo crear el punto de restauracion: $checkpointError"
+        $warning = "No se pudo crear el Punto de Restauracion del Sistema.`n`nError: $checkpointError`n`nNo se realizara ningun cambio sin tu autorizacion explicita.`n¿Eres el tecnico responsable y confirmas continuar SIN punto de restauracion?"
+        if (-not (Confirm-ToolkitDialog -Title 'ADVERTENCIA: sin punto de restauracion' -Message $warning)) {
+            Write-ToolkitLog "CANCELADO: $Operation porque fallo la creacion del punto de restauracion y no se autorizo continuar."
+            return $false
+        }
+        Write-ToolkitLog "CONTINUACION AUTORIZADA sin punto de restauracion: $Operation."
+    }
+
+    try {
+        & $Action
+        Write-ToolkitLog "Finalizado: $Operation."
+        return $true
+    } catch {
+        Write-ToolkitLog "ERROR en $Operation`: $($_.Exception.Message)"
+        throw
+    }
+}
+
+Export-ModuleMember -Function Write-ToolkitLog, Confirm-ToolkitDialog, Invoke-ToolkitSystemChange
+'@
+Write-TextFile -Path (Join-Path $ToolkitRoot 'Toolkit-SystemChange.psm1') -Content $SystemChangeContent -Encoding Utf8Bom
+
+# ---------- Toolkit-SafetyCheck.ps1 ----------
+$SafetyCheckContent = @'
+#Requires -Version 5.1
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Operation)
+$ErrorActionPreference = 'Stop'
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    try {
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -Operation "{1}"' -f $PSCommandPath, $Operation
+        $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -Verb RunAs -Wait -PassThru
+        exit $process.ExitCode
+    } catch {
+        Write-Error "No se pudo completar la comprobacion de seguridad elevada: $($_.Exception.Message)"
+        exit 1
+    }
+}
+$modulePath = Join-Path $PSScriptRoot 'Toolkit-SystemChange.psm1'
+if (-not (Test-Path -LiteralPath $modulePath)) { Write-Error 'Falta Toolkit-SystemChange.psm1; no se permite continuar.'; exit 2 }
+Import-Module -Name $modulePath -Force -ErrorAction Stop
+try {
+    if (Invoke-ToolkitSystemChange -Operation $Operation -Description "Windows Repair: $Operation" -Action { }) { exit 0 }
+    exit 1
+} catch {
+    Write-Error $_.Exception.Message
+    exit 2
+}
+'@
+Write-TextFile -Path (Join-Path $ToolkitRoot 'Toolkit-SafetyCheck.ps1') -Content $SafetyCheckContent -Encoding Utf8Bom
+
+# ---------- Optimize-Windows.ps1 (modulo 05) ----------
+$OptimizeWindowsContent = @'
+#Requires -Version 5.1
+[CmdletBinding()]
+param()
+$ErrorActionPreference = 'Stop'
+$modulePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Toolkit-SystemChange.psm1'
+if (-not (Test-Path -LiteralPath $modulePath)) { throw "No se encontro el control de seguridad requerido: $modulePath" }
+Import-Module -Name $modulePath -Force -ErrorAction Stop
+
+$action = {
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in @(
+        @{ Name = 'DiagTrack'; StartupType = 'Disabled' }
+        @{ Name = 'WerSvc'; StartupType = 'Disabled' }
+        @{ Name = 'MapsBroker'; StartupType = 'Disabled' }
+        @{ Name = 'SysMain'; StartupType = 'Manual' }
+        @{ Name = 'WSearch'; StartupType = 'Manual' }
+        @{ Name = 'Spooler'; StartupType = 'Manual' }
+    )) {
+        try {
+            Set-Service -Name $entry.Name -StartupType $entry.StartupType -ErrorAction Stop
+            Write-ToolkitLog "Servicio $($entry.Name): tipo de inicio $($entry.StartupType)."
+        } catch {
+            $failures.Add("Servicio $($entry.Name): $($_.Exception.Message)")
+            Write-ToolkitLog "ERROR configurando servicio $($entry.Name): $($_.Exception.Message)"
+        }
+    }
+
+    $profilePath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+    $gamesPath = Join-Path $profilePath 'Tasks\Games'
+    try {
+        [void](New-Item -Path $profilePath -Force -ErrorAction Stop)
+        [void](New-ItemProperty -LiteralPath $profilePath -Name 'SystemResponsiveness' -Value 0 -PropertyType DWord -Force -ErrorAction Stop)
+        [void](New-ItemProperty -LiteralPath $profilePath -Name 'NetworkThrottlingIndex' -Value ([uint32]::MaxValue) -PropertyType DWord -Force -ErrorAction Stop)
+        [void](New-Item -Path $gamesPath -Force -ErrorAction Stop)
+        [void](New-ItemProperty -LiteralPath $gamesPath -Name 'GPU Priority' -Value 8 -PropertyType DWord -Force -ErrorAction Stop)
+        [void](New-ItemProperty -LiteralPath $gamesPath -Name 'Priority' -Value 6 -PropertyType DWord -Force -ErrorAction Stop)
+        [void](New-ItemProperty -LiteralPath $gamesPath -Name 'Scheduling Category' -Value 'High' -PropertyType String -Force -ErrorAction Stop)
+        Write-ToolkitLog 'Valores Multimedia SystemProfile y Tasks\Games actualizados.'
+    } catch {
+        $failures.Add("Registro multimedia: $($_.Exception.Message)")
+        Write-ToolkitLog "ERROR actualizando el registro multimedia: $($_.Exception.Message)"
+    }
+    if ($failures.Count -gt 0) { throw ($failures -join [Environment]::NewLine) }
+}
+
+if (-not (Invoke-ToolkitSystemChange -Operation 'Optimizacion de Windows (servicios y multimedia)' -Description 'Se cambiaran seis servicios de Windows y valores de registro de prioridad multimedia. Puede afectar busqueda, impresion, mapas, informes de errores y telemetria.' -Action $action)) {
+    throw 'Operacion cancelada; no se aplicaron cambios.'
+}
+Write-Host 'Optimizacion de Windows completada. Consulta el log del toolkit para ver el detalle.' -ForegroundColor Green
+'@
+Write-TextFile -Path (Join-Path $ToolkitRoot '05_PC_Troubleshooting/Optimize-Windows.ps1') -Content $OptimizeWindowsContent -Encoding Utf8Bom
+
+# ---------- Optimize-TCP.ps1 (modulo 06) ----------
+$OptimizeTcpContent = @'
+#Requires -Version 5.1
+[CmdletBinding()]
+param()
+$ErrorActionPreference = 'Stop'
+$modulePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Toolkit-SystemChange.psm1'
+if (-not (Test-Path -LiteralPath $modulePath)) { throw "No se encontro el control de seguridad requerido: $modulePath" }
+Import-Module -Name $modulePath -Force -ErrorAction Stop
+
+$action = {
+    function Invoke-NetshSetting {
+        param([string[]]$Arguments)
+        $output = @(& netsh.exe @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        foreach ($line in $output) { Write-ToolkitLog "netsh $($Arguments -join ' '): $line" }
+        if ($exitCode -ne 0) { throw "netsh $($Arguments -join ' ') termino con codigo $exitCode." }
+    }
+    Invoke-NetshSetting @('int', 'tcp', 'set', 'global', 'autotuninglevel=normal')
+    Invoke-NetshSetting @('int', 'tcp', 'set', 'global', 'ecncapability=disabled')
+    Invoke-NetshSetting @('int', 'tcp', 'set', 'global', 'timestamps=disabled')
+
+    $globalOutput = @(& netsh.exe int tcp set global congestionprovider=cubic 2>&1)
+    $globalExitCode = $LASTEXITCODE
+    foreach ($line in $globalOutput) { Write-ToolkitLog "netsh int tcp set global congestionprovider=cubic: $line" }
+    if ($globalExitCode -ne 0) {
+        Write-ToolkitLog 'La sintaxis global para congestionprovider fallo; probando el ajuste supplemental custom.'
+        Invoke-NetshSetting @('int', 'tcp', 'set', 'supplemental', 'template=custom', 'congestionprovider=cubic')
+    }
+
+    $dnsOutput = @(& ipconfig.exe /flushdns 2>&1)
+    $dnsExitCode = $LASTEXITCODE
+    foreach ($line in $dnsOutput) { Write-ToolkitLog "ipconfig /flushdns: $line" }
+    if ($dnsExitCode -ne 0) { throw "ipconfig /flushdns termino con codigo $dnsExitCode." }
+}
+
+if (-not (Invoke-ToolkitSystemChange -Operation 'Optimizacion basica TCP y limpieza DNS' -Description 'Se cambiara la configuracion global TCP de Windows y se vaciara la cache DNS. El ajuste puede afectar el comportamiento de red.' -Action $action)) {
+    throw 'Operacion cancelada; no se aplicaron cambios.'
+}
+Write-Host 'Ajustes TCP y vaciado DNS completados. Consulta el log del toolkit para ver el detalle.' -ForegroundColor Green
+'@
+Write-TextFile -Path (Join-Path $ToolkitRoot '06_Network_Repair/Optimize-TCP.ps1') -Content $OptimizeTcpContent -Encoding Utf8Bom
+
+# ---------- Power-Tune.ps1 (modulo 09) ----------
+$PowerTuneContent = @'
+#Requires -Version 5.1
+[CmdletBinding()]
+param()
+$ErrorActionPreference = 'Stop'
+$modulePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Toolkit-SystemChange.psm1'
+if (-not (Test-Path -LiteralPath $modulePath)) { throw "No se encontro el control de seguridad requerido: $modulePath" }
+Import-Module -Name $modulePath -Force -ErrorAction Stop
+
+$action = {
+    function Invoke-PowerCfg {
+        param([string[]]$Arguments)
+        $output = @(& powercfg.exe @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        foreach ($line in $output) { Write-ToolkitLog "powercfg $($Arguments -join ' '): $line" }
+        if ($exitCode -ne 0) { throw "powercfg $($Arguments -join ' ') termino con codigo $exitCode." }
+        return $output
+    }
+
+    $duplicateOutput = Invoke-PowerCfg @('-duplicatescheme', 'e9a42b02-d5df-448d-aa00-03f14749eb61')
+    $guidMatch = [regex]::Match(($duplicateOutput -join "`n"), '(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b')
+    if (-not $guidMatch.Success) { throw 'powercfg no devolvio el GUID del plan duplicado.' }
+    $schemeGuid = $guidMatch.Value
+    [void](Invoke-PowerCfg @('/setactive', $schemeGuid))
+    [void](Invoke-PowerCfg @('-setacvalueindex', 'scheme_current', 'sub_processor', 'CPMINCORES', '100'))
+    [void](Invoke-PowerCfg @('-setactive', 'scheme_current'))
+    Write-ToolkitLog "Plan Ultimate Performance activado: $schemeGuid; Core Parking AC configurado a 100%."
+}
+
+if (-not (Invoke-ToolkitSystemChange -Operation 'Power-Tune (Ultimate Performance y Core Parking)' -Description 'Se agregara y activara el plan Ultimate Performance y se desactivara Core Parking con corriente alterna. Puede aumentar el consumo y la temperatura del equipo.' -Action $action)) {
+    throw 'Operacion cancelada; no se aplicaron cambios.'
+}
+Write-Host 'Plan Ultimate Performance activado y Core Parking ajustado. Consulta el log del toolkit para ver el detalle.' -ForegroundColor Green
+'@
+Write-TextFile -Path (Join-Path $ToolkitRoot '09_Power_Tune/Power-Tune.ps1') -Content $PowerTuneContent -Encoding Utf8Bom
 
 # ---------- Fix-Windows.bat ----------
 $FixWindowsContent = @'
@@ -347,16 +590,22 @@ start "" notepad.exe "%~dp0MANUAL.txt"
 goto MENU
 
 :OPT1
+call :SAFETY_CHECK "Mantenimiento y limpieza del sistema"
+if errorlevel 1 goto MENU
 call :MANTENIMIENTO_SO
 pause
 goto MENU
 
 :OPT2
+call :SAFETY_CHECK "Reparacion de archivos de sistema (DISM y SFC)"
+if errorlevel 1 goto MENU
 call :REPARACION_SISTEMA
 pause
 goto MENU
 
 :OPT3
+call :SAFETY_CHECK "Reparacion de red basica"
+if errorlevel 1 goto MENU
 call :RED_BASICA
 pause
 goto MENU
@@ -366,6 +615,8 @@ echo.
 echo ADVERTENCIA: la red se desconectara y el equipo debera reiniciarse.
 choice /c SN /n /m "Continuar? (S/N): "
 if errorlevel 2 goto MENU
+call :SAFETY_CHECK "Reseteo profundo de red TCP/IP"
+if errorlevel 1 goto MENU
 call :RED_PROFUNDA
 pause
 goto MENU
@@ -375,6 +626,8 @@ echo.
 echo ADVERTENCIA: no lo ejecutes mientras Windows esta instalando actualizaciones.
 choice /c SN /n /m "Continuar? (S/N): "
 if errorlevel 2 goto MENU
+call :SAFETY_CHECK "Restablecer componentes de Windows Update"
+if errorlevel 1 goto MENU
 call :REPARACION_WU
 pause
 goto MENU
@@ -384,6 +637,8 @@ echo.
 echo El mantenimiento completo incluye restablecer Windows Update y puede tardar bastante.
 choice /c SN /n /m "Continuar? (S/N): "
 if errorlevel 2 goto MENU
+call :SAFETY_CHECK "Mantenimiento completo (1 + 2 + 3 + 5)"
+if errorlevel 1 goto MENU
 call :MANTENIMIENTO_SO
 call :REPARACION_SISTEMA
 call :RED_BASICA
@@ -398,6 +653,11 @@ goto MENU
 rem =======================================================================
 rem  RUTINAS
 rem =======================================================================
+
+:SAFETY_CHECK
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\Toolkit-SafetyCheck.ps1" -Operation "%~1"
+if errorlevel 1 exit /b 1
+exit /b 0
 
 :LOG
 >>"%LOG%" echo [%date% %time%] %~1
@@ -728,6 +988,22 @@ function Confirm-Action {
     return ($r -match '^(s|si|y|yes)$')
 }
 
+function Invoke-SafeSystemChange {
+    param([string]$Operation, [string]$Description, [scriptblock]$Action)
+    $modulePath = Join-Path $ToolkitRoot 'Toolkit-SystemChange.psm1'
+    if (-not (Test-Path -LiteralPath $modulePath)) {
+        Write-Line ' [ERROR] Falta Toolkit-SystemChange.psm1; no se aplico ningun cambio.' Red
+        return $false
+    }
+    try {
+        Import-Module -Name $modulePath -Force -ErrorAction Stop
+        return [bool](Invoke-ToolkitSystemChange -Operation $Operation -Description $Description -Action $Action)
+    } catch {
+        Write-Line " [ERROR] $($_.Exception.Message)" Red
+        return $false
+    }
+}
+
 function Format-Size {
     param([long]$Bytes)
     if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
@@ -777,7 +1053,8 @@ function Step-UninstallPrograms {
     foreach ($a in $apps) {
         Write-Line (' Encontrado: {0} {1}' -f $a.DisplayName, $a.DisplayVersion) Yellow
         if (-not (Confirm-Action "  Desinstalar $($a.DisplayName)?")) { Write-Line '  Omitido.'; continue }
-        try { Invoke-Uninstall $a } catch { Write-Line "  [ERROR] $($_.Exception.Message)" Red; continue }
+        $appToRemove = $a
+        if (-not (Invoke-SafeSystemChange -Operation "Desinstalar $($a.DisplayName)" -Description "Se desinstalara $($a.DisplayName) $($a.DisplayVersion)." -Action { Invoke-Uninstall $appToRemove })) { continue }
         $still = @(Get-InstalledPrograms | Where-Object { $_.DisplayName -eq $a.DisplayName })
         if ($still.Count -eq 0) { Write-Line "  [OK] $($a.DisplayName) desinstalado." Green }
         else { Write-Line '  [!] Sigue apareciendo: la desinstalacion pudo cancelarse o requiere reiniciar.' Yellow }
@@ -817,14 +1094,15 @@ function Get-LeftoverItems {
 
 function Remove-LeftoverItem {
     param($Item)
-    try {
-        switch ($Item.Kind) {
-            'IFEO' { Remove-ItemProperty -Path $Item.Path -Name Debugger -ErrorAction Stop }
-            default { Remove-Item -LiteralPath $Item.Path -Recurse -Force -ErrorAction Stop }
+    $itemToRemove = $Item
+    $removeAction = {
+        switch ($itemToRemove.Kind) {
+            'IFEO' { Remove-ItemProperty -Path $itemToRemove.Path -Name Debugger -ErrorAction Stop }
+            default { Remove-Item -LiteralPath $itemToRemove.Path -Recurse -Force -ErrorAction Stop }
         }
+    }
+    if (Invoke-SafeSystemChange -Operation "Limpiar $($Item.Label)" -Description "Se eliminara: $($Item.Path)" -Action $removeAction) {
         Write-Line "  [OK] $($Item.Label)" Green
-    } catch {
-        Write-Line "  [ERROR] $($Item.Label): $($_.Exception.Message)" Red
     }
 }
 
@@ -855,8 +1133,9 @@ function Step-RevertWindowsUpdate {
         $found = $true
         Write-Line ' El servicio de Windows Update esta DESACTIVADO.' Yellow
         if (Confirm-Action '  Volver a ponerlo en Manual (valor por defecto) e iniciarlo?') {
-            try { Set-Service -Name wuauserv -StartupType Manual -ErrorAction Stop; Start-Service -Name wuauserv -ErrorAction Stop; Write-Line '  [OK] Servicio restablecido.' Green }
-            catch { Write-Line "  [ERROR] $($_.Exception.Message)" Red }
+            if (Invoke-SafeSystemChange -Operation 'Restablecer servicio Windows Update' -Description 'Se habilitara e iniciara el servicio wuauserv.' -Action { Set-Service -Name wuauserv -StartupType Manual -ErrorAction Stop; Start-Service -Name wuauserv -ErrorAction Stop }) {
+                Write-Line '  [OK] Servicio restablecido.' Green
+            }
         }
     }
 
@@ -867,8 +1146,9 @@ function Step-RevertWindowsUpdate {
         Write-Line " Hay una directiva local 'NoAutoUpdate' = $noAuto (actualizaciones automaticas configuradas por politica)." Yellow
         Write-Line '  Aviso: en equipos de una empresa/dominio la puede haber puesto tu administrador.'
         if (Confirm-Action '  Quitar la directiva NoAutoUpdate?') {
-            try { Remove-ItemProperty -Path $au -Name NoAutoUpdate -ErrorAction Stop; Write-Line '  [OK] Directiva eliminada (se aplica tras gpupdate o reinicio).' Green }
-            catch { Write-Line "  [ERROR] $($_.Exception.Message)" Red }
+            if (Invoke-SafeSystemChange -Operation 'Quitar directiva local de Windows Update' -Description "Se quitara NoAutoUpdate de $au." -Action { Remove-ItemProperty -Path $au -Name NoAutoUpdate -ErrorAction Stop }) {
+                Write-Line '  [OK] Directiva eliminada (se aplica tras gpupdate o reinicio).' Green
+            }
         }
     }
 
@@ -879,8 +1159,10 @@ function Step-RevertWindowsUpdate {
         $found = $true
         Write-Line (" Tarea programada de WAU Manager: {0}{1}" -f $t.TaskPath, $t.TaskName) Yellow
         if (Confirm-Action '  Eliminar esta tarea?') {
-            try { Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop; Write-Line '  [OK] Tarea eliminada.' Green }
-            catch { Write-Line "  [ERROR] $($_.Exception.Message)" Red }
+            $taskToRemove = $t
+            if (Invoke-SafeSystemChange -Operation "Eliminar tarea WAU Manager $($t.TaskName)" -Description "Se eliminara la tarea programada $($t.TaskPath)$($t.TaskName)." -Action { Unregister-ScheduledTask -TaskName $taskToRemove.TaskName -TaskPath $taskToRemove.TaskPath -Confirm:$false -ErrorAction Stop }) {
+                Write-Line '  [OK] Tarea eliminada.' Green
+            }
         }
     }
     if (-not $found) { Write-Line ' Windows Update esta con su configuracion normal. Nada que revertir.' Green }
@@ -981,21 +1263,354 @@ while ($true) {
 '@
 Write-TextFile -Path (Join-Path $ToolkitRoot '08_Uninstall_Reset/Uninstall-Toolkit.ps1') -Content $UninstallContent -Encoding Utf8Bom
 
+# ---------- Toolkit-GUI.ps1 ----------
+$GuiContent = @'
+#Requires -Version 5.1
+[CmdletBinding()]
+param()
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    try {
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $PSCommandPath
+        Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -Verb RunAs
+    } catch {
+        Write-Error "No se pudo iniciar la interfaz con permisos de Administrador: $($_.Exception.Message)"
+        exit 1
+    }
+    exit 0
+}
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms -ErrorAction Stop
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ToolkitConsoleWindow { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int command); }' -ErrorAction Stop
+$consoleHandle = [ToolkitConsoleWindow]::GetConsoleWindow()
+if ($consoleHandle -ne [IntPtr]::Zero) { [void][ToolkitConsoleWindow]::ShowWindow($consoleHandle, 0) }
+
+$root = $PSScriptRoot
+$script:LogPath = Join-Path $root '05_PC_Troubleshooting\Logs'
+$script:FallbackLogPath = Join-Path $env:ProgramData 'IT-Helpdesk-Toolkit\Logs'
+$script:Modules = @(
+    [pscustomobject]@{ Id='00'; Name='Soporte remoto'; Description='Acceso remoto portable para soporte autorizado.'; Actions=@(
+        [pscustomobject]@{ Name='Abrir RustDesk'; Kind='File'; Target='00_Remote\RustDesk_Portable.exe' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='00_Remote' }) }
+    [pscustomobject]@{ Id='01'; Name='VPN'; Description='Instalador del cliente WireGuard.'; Actions=@(
+        [pscustomobject]@{ Name='Instalar WireGuard'; Kind='Msi'; Target='01_VPN\WireGuard_Setup.msi' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='01_VPN' }) }
+    [pscustomobject]@{ Id='02'; Name='Windows Update'; Description='Herramientas para administrar actualizaciones.'; Actions=@(
+        [pscustomobject]@{ Name='Abrir WAU Manager'; Kind='File'; Target='02_Updates\WAU_Manager.exe' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='02_Updates' }) }
+    [pscustomobject]@{ Id='03'; Name='Antivirus'; Description='Escaneo bajo demanda con KVRT.'; Actions=@(
+        [pscustomobject]@{ Name='Ejecutar KVRT'; Kind='File'; Target='03_Antivirus\KVRT.exe' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='03_Antivirus' }) }
+    [pscustomobject]@{ Id='04'; Name='Actualizador de apps'; Description='Administración de aplicaciones con UniGetUI.'; Actions=@(
+        [pscustomobject]@{ Name='Abrir UniGetUI'; Kind='FindFile'; Target='04_App_Updater|UniGetUI.exe' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='04_App_Updater' }) }
+    [pscustomobject]@{ Id='05'; Name='Solución de problemas'; Description='Reparación, optimización de Windows y diagnóstico avanzado.'; Actions=@(
+        [pscustomobject]@{ Name='Reparar Windows'; Kind='File'; Target='05_PC_Troubleshooting\Fix-Windows.bat' }
+        [pscustomobject]@{ Name='Optimizar Windows'; Kind='Script'; Target='05_PC_Troubleshooting\Optimize-Windows.ps1' }
+        [pscustomobject]@{ Name='Sysinternals'; Kind='Folder'; Target='05_PC_Troubleshooting\Sysinternals' }) }
+    [pscustomobject]@{ Id='06'; Name='Diagnóstico de red'; Description='Pruebas de conectividad y optimización TCP.'; Actions=@(
+        [pscustomobject]@{ Name='Diagnosticar red'; Kind='ConsoleScript'; Target='06_Network_Repair\Network-Diagnostics.ps1' }
+        [pscustomobject]@{ Name='Optimizar TCP y vaciar DNS'; Kind='Script'; Target='06_Network_Repair\Optimize-TCP.ps1' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='06_Network_Repair' }) }
+    [pscustomobject]@{ Id='07'; Name='Auditoría e inventario'; Description='Inventario de hardware y herramientas de auditoría.'; Actions=@(
+        [pscustomobject]@{ Name='Generar inventario'; Kind='ConsoleScript'; Target='07_Audit_Inventory\Get-Inventory.ps1' }
+        [pscustomobject]@{ Name='Ejecutar ShowKeyPlus'; Kind='FindFile'; Target='07_Audit_Inventory\ShowKeyPlus|ShowKeyPlus.exe' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='07_Audit_Inventory' }) }
+    [pscustomobject]@{ Id='08'; Name='Desinstalar y reset'; Description='Desinstalación y limpieza con confirmación previa.'; Actions=@(
+        [pscustomobject]@{ Name='Abrir módulo 08'; Kind='ConsoleScript'; Target='08_Uninstall_Reset\Uninstall-Toolkit.ps1' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='08_Uninstall_Reset' }) }
+    [pscustomobject]@{ Id='09'; Name='Power-Tune'; Description='Plan Ultimate Performance y ajuste de Core Parking.'; Actions=@(
+        [pscustomobject]@{ Name='Aplicar ajuste de energía'; Kind='Script'; Target='09_Power_Tune\Power-Tune.ps1' }
+        [pscustomobject]@{ Name='Abrir carpeta'; Kind='Folder'; Target='09_Power_Tune' }) }
+)
+
+function New-ToolkitButton {
+    param([string]$Text, [string]$Background = '#1F2937', [double]$Height = 48)
+    $button = New-Object System.Windows.Controls.Button
+    $button.Content = $Text
+    $button.Height = $Height
+    $button.Margin = [System.Windows.Thickness]::new(0, 0, 10, 10)
+    $button.Padding = [System.Windows.Thickness]::new(14, 8, 14, 8)
+    $button.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#F9FAFB')
+    $button.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString($Background)
+    $button.BorderThickness = [System.Windows.Thickness]::new(0)
+    $button.FontSize = 14
+    $button.Cursor = [System.Windows.Input.Cursors]::Hand
+    return $button
+}
+
+function Refresh-ToolkitLog {
+    $logs = @(
+        Get-ChildItem -LiteralPath $script:LogPath -Filter 'IT-Toolkit_*.log' -File -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $script:FallbackLogPath -Filter 'IT-Toolkit_*.log' -File -ErrorAction SilentlyContinue
+    ) | Sort-Object LastWriteTime -Descending
+    if ($logs.Count -eq 0) { $script:LogBox.Text = 'Aún no hay operaciones registradas.'; return }
+    $script:LogBox.Text = (Get-Content -LiteralPath $logs[0].FullName -Tail 80 -Encoding UTF8 -ErrorAction Stop) -join [Environment]::NewLine
+    $script:LogBox.ScrollToEnd()
+}
+
+function Invoke-UiAction {
+    param($Action)
+    $target = Join-Path $root $Action.Target
+    try {
+        switch ($Action.Kind) {
+            'Script' {
+                if (-not (Test-Path -LiteralPath $target)) { throw "No se encontro el script: $target" }
+                $script:StatusText.Text = "Ejecutando: $($Action.Name)..."
+                & $target
+                $script:StatusText.Text = "Terminado: $($Action.Name)"
+            }
+            'ConsoleScript' {
+                if (-not (Test-Path -LiteralPath $target)) { throw "No se encontro el script: $target" }
+                $args = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $target
+                Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $args -Wait
+                $script:StatusText.Text = "Terminado: $($Action.Name)"
+            }
+            'Msi' {
+                if (-not (Test-Path -LiteralPath $target)) { throw "No se encontro el instalador: $target" }
+                $modulePath = Join-Path $root 'Toolkit-SystemChange.psm1'
+                if (-not (Test-Path -LiteralPath $modulePath)) { throw 'Falta Toolkit-SystemChange.psm1; no se inicio el instalador.' }
+                Import-Module -Name $modulePath -Force -ErrorAction Stop
+                $installerPath = $target
+                $installAction = { Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "{0}"' -f $installerPath) }.GetNewClosure()
+                if (-not (Invoke-ToolkitSystemChange -Operation 'Instalar WireGuard' -Description 'Se iniciara el instalador de WireGuard, que agrega componentes y servicios de red.' -Action $installAction)) {
+                    $script:StatusText.Text = 'Instalacion cancelada.'
+                    break
+                }
+                $script:StatusText.Text = "Iniciado: $($Action.Name)"
+            }
+            'File' {
+                if (-not (Test-Path -LiteralPath $target)) { throw "No se encontro el archivo: $target" }
+                if ($Action.Target -eq '02_Updates\WAU_Manager.exe') {
+                    $modulePath = Join-Path $root 'Toolkit-SystemChange.psm1'
+                    if (-not (Test-Path -LiteralPath $modulePath)) { throw 'Falta Toolkit-SystemChange.psm1; no se inicio WAU Manager.' }
+                    Import-Module -Name $modulePath -Force -ErrorAction Stop
+                    $wauPath = $target
+                    $wauAction = { Start-Process -FilePath $wauPath }.GetNewClosure()
+                    if (-not (Invoke-ToolkitSystemChange -Operation 'Iniciar WAU Manager' -Description 'WAU Manager puede modificar el servicio y la configuracion de Windows Update.' -Action $wauAction)) {
+                        $script:StatusText.Text = 'Operacion cancelada.'
+                        break
+                    }
+                } else {
+                    if ([IO.Path]::GetExtension($target) -eq '.bat') {
+                        Start-Process -FilePath $env:ComSpec -ArgumentList ('/c "{0}"' -f $target)
+                    } else {
+                        Start-Process -FilePath $target
+                    }
+                }
+                $script:StatusText.Text = "Iniciado: $($Action.Name)"
+            }
+            'FindFile' {
+                $parts = $Action.Target -split '\|', 2
+                $folder = Join-Path $root $parts[0]
+                $found = Get-ChildItem -LiteralPath $folder -Filter $parts[1] -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if (-not $found) { throw "No se encontro $($parts[1]) dentro de $folder" }
+                Start-Process -FilePath $found.FullName
+                $script:StatusText.Text = "Iniciado: $($Action.Name)"
+            }
+            'Folder' {
+                if (-not (Test-Path -LiteralPath $target)) { throw "No se encontro la carpeta: $target" }
+                Start-Process -FilePath $target
+                $script:StatusText.Text = "Abierta: $($Action.Name)"
+            }
+            default { throw "Accion no reconocida: $($Action.Kind)" }
+        }
+    } catch {
+        $script:StatusText.Text = "Error: $($Action.Name)"
+        [System.Windows.MessageBox]::Show($_.Exception.Message, 'IT Helpdesk Toolkit - Error', 'OK', 'Error') | Out-Null
+    } finally {
+        Refresh-ToolkitLog
+    }
+}
+
+function Show-ToolkitModule {
+    param($Module)
+    $script:TitleText.Text = ('{0}  |  {1}' -f $Module.Id, $Module.Name)
+    $script:DescriptionText.Text = $Module.Description
+    $script:ActionPanel.Children.Clear()
+    foreach ($action in $Module.Actions) {
+        $button = New-ToolkitButton -Text $action.Name -Background $(if ($action.Kind -eq 'Script') { '#1D4ED8' } else { '#263449' }) -Height 62
+        $button.MinWidth = 210
+        $button.Add_Click({ Invoke-UiAction -Action $action }.GetNewClosure())
+        [void]$script:ActionPanel.Children.Add($button)
+    }
+    $manualButton = New-ToolkitButton -Text 'Abrir manual del módulo' -Background '#374151' -Height 42
+    $manualButton.Add_Click({
+        $folder = switch ($Module.Id) {
+            '00' { '00_Remote' } '01' { '01_VPN' } '02' { '02_Updates' } '03' { '03_Antivirus' }
+            '04' { '04_App_Updater' } '05' { '05_PC_Troubleshooting' } '06' { '06_Network_Repair' }
+            '07' { '07_Audit_Inventory' } '08' { '08_Uninstall_Reset' } '09' { '09_Power_Tune' }
+        }
+        $manualPath = Join-Path $root (Join-Path $folder 'MANUAL.txt')
+        if (Test-Path -LiteralPath $manualPath) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $manualPath) }
+        else { [System.Windows.MessageBox]::Show('El manual de este módulo no existe.', 'IT Helpdesk Toolkit') | Out-Null }
+    }.GetNewClosure())
+    [void]$script:ActionPanel.Children.Add($manualButton)
+}
+
+$window = New-Object System.Windows.Window
+$window.Title = 'IT Helpdesk Toolkit'
+$window.Width = 1080
+$window.Height = 720
+$window.MinWidth = 900
+$window.MinHeight = 620
+$window.WindowStartupLocation = 'CenterScreen'
+$window.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#0B1220')
+$window.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#F9FAFB')
+$window.FontFamily = 'Segoe UI'
+
+$layout = New-Object System.Windows.Controls.Grid
+$leftColumn = New-Object System.Windows.Controls.ColumnDefinition
+$leftColumn.Width = [System.Windows.GridLength]::new(245)
+$rightColumn = New-Object System.Windows.Controls.ColumnDefinition
+$rightColumn.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+[void]$layout.ColumnDefinitions.Add($leftColumn)
+[void]$layout.ColumnDefinitions.Add($rightColumn)
+$window.Content = $layout
+
+$sidebar = New-Object System.Windows.Controls.StackPanel
+$sidebar.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#111827')
+$sidebar.Margin = [System.Windows.Thickness]::new(0)
+[System.Windows.Controls.Grid]::SetColumn($sidebar, 0)
+[void]$layout.Children.Add($sidebar)
+$brand = New-Object System.Windows.Controls.TextBlock
+$brand.Text = "IT HELPDESK`nTOOLKIT"
+$brand.FontSize = 21
+$brand.FontWeight = 'Bold'
+$brand.Margin = [System.Windows.Thickness]::new(20, 24, 10, 4)
+$brand.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#60A5FA')
+[void]$sidebar.Children.Add($brand)
+$adminLabel = New-Object System.Windows.Controls.TextBlock
+$adminLabel.Text = 'Sesión de soporte elevada'
+$adminLabel.FontSize = 12
+$adminLabel.Margin = [System.Windows.Thickness]::new(20, 0, 10, 18)
+$adminLabel.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#9CA3AF')
+[void]$sidebar.Children.Add($adminLabel)
+$navScroll = New-Object System.Windows.Controls.ScrollViewer
+$navScroll.VerticalScrollBarVisibility = 'Auto'
+$navStack = New-Object System.Windows.Controls.StackPanel
+foreach ($module in $script:Modules) {
+    $navButton = New-ToolkitButton -Text ("{0}   {1}" -f $module.Id, $module.Name) -Background '#111827' -Height 42
+    $navButton.HorizontalContentAlignment = 'Left'
+    $navButton.Margin = [System.Windows.Thickness]::new(10, 1, 10, 1)
+    $navButton.Add_Click({ Show-ToolkitModule -Module $module }.GetNewClosure())
+    [void]$navStack.Children.Add($navButton)
+}
+$navScroll.Content = $navStack
+[void]$sidebar.Children.Add($navScroll)
+
+$content = New-Object System.Windows.Controls.Grid
+$content.Margin = [System.Windows.Thickness]::new(28, 24, 28, 20)
+$content.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = 'Auto' })) | Out-Null
+$content.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = 'Auto' })) | Out-Null
+$content.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = '*' })) | Out-Null
+$content.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = 'Auto' })) | Out-Null
+[System.Windows.Controls.Grid]::SetColumn($content, 1)
+[void]$layout.Children.Add($content)
+
+$script:TitleText = New-Object System.Windows.Controls.TextBlock
+$script:TitleText.FontSize = 28
+$script:TitleText.FontWeight = 'SemiBold'
+$script:TitleText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+[System.Windows.Controls.Grid]::SetRow($script:TitleText, 0)
+[void]$content.Children.Add($script:TitleText)
+$script:DescriptionText = New-Object System.Windows.Controls.TextBlock
+$script:DescriptionText.FontSize = 14
+$script:DescriptionText.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#9CA3AF')
+$script:DescriptionText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 20)
+[System.Windows.Controls.Grid]::SetRow($script:DescriptionText, 1)
+[void]$content.Children.Add($script:DescriptionText)
+
+$body = New-Object System.Windows.Controls.Grid
+$body.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = '*' })) | Out-Null
+$body.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = 'Auto' })) | Out-Null
+[System.Windows.Controls.Grid]::SetRow($body, 2)
+[void]$content.Children.Add($body)
+$actionScroll = New-Object System.Windows.Controls.ScrollViewer
+$actionScroll.VerticalScrollBarVisibility = 'Auto'
+$actionPanel = New-Object System.Windows.Controls.WrapPanel
+$script:ActionPanel = $actionPanel
+$actionScroll.Content = $actionPanel
+[System.Windows.Controls.Grid]::SetRow($actionScroll, 0)
+[void]$body.Children.Add($actionScroll)
+$logBorder = New-Object System.Windows.Controls.Border
+$logBorder.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#111827')
+$logBorder.CornerRadius = [System.Windows.CornerRadius]::new(8)
+$logBorder.Padding = [System.Windows.Thickness]::new(14)
+$logBorder.Margin = [System.Windows.Thickness]::new(0, 16, 0, 0)
+[System.Windows.Controls.Grid]::SetRow($logBorder, 1)
+[void]$body.Children.Add($logBorder)
+$logGrid = New-Object System.Windows.Controls.Grid
+$logGrid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = 'Auto' })) | Out-Null
+$logGrid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = '*' })) | Out-Null
+$logBorder.Child = $logGrid
+$logHeading = New-Object System.Windows.Controls.TextBlock
+$logHeading.Text = 'Registro de operaciones'
+$logHeading.FontWeight = 'SemiBold'
+$logHeading.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+[System.Windows.Controls.Grid]::SetRow($logHeading, 0)
+[void]$logGrid.Children.Add($logHeading)
+$script:LogBox = New-Object System.Windows.Controls.TextBox
+$script:LogBox.IsReadOnly = $true
+$script:LogBox.AcceptsReturn = $true
+$script:LogBox.TextWrapping = 'Wrap'
+$script:LogBox.VerticalScrollBarVisibility = 'Auto'
+$script:LogBox.FontFamily = 'Consolas'
+$script:LogBox.FontSize = 11
+$script:LogBox.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#D1D5DB')
+$script:LogBox.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#0B1220')
+[System.Windows.Controls.Grid]::SetRow($script:LogBox, 1)
+[void]$logGrid.Children.Add($script:LogBox)
+
+$footer = New-Object System.Windows.Controls.Grid
+$footer.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = '*' })) | Out-Null
+$footer.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = 'Auto' })) | Out-Null
+$script:StatusText = New-Object System.Windows.Controls.TextBlock
+$script:StatusText.Text = 'Selecciona un módulo para comenzar.'
+$script:StatusText.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#9CA3AF')
+$script:StatusText.VerticalAlignment = 'Center'
+[System.Windows.Controls.Grid]::SetRow($footer, 3)
+[void]$content.Children.Add($footer)
+[void]$footer.Children.Add($script:StatusText)
+$refreshButton = New-ToolkitButton -Text 'Actualizar log' -Background '#374151' -Height 36
+$refreshButton.Margin = [System.Windows.Thickness]::new(12, 12, 0, 0)
+$refreshButton.Add_Click({ Refresh-ToolkitLog })
+[System.Windows.Controls.Grid]::SetColumn($refreshButton, 1)
+[void]$footer.Children.Add($refreshButton)
+
+$script:Modules | Where-Object { $_.Id -eq '05' } | Select-Object -First 1 | ForEach-Object { Show-ToolkitModule $_ }
+Refresh-ToolkitLog
+[void]$window.ShowDialog()
+'@
+Write-TextFile -Path (Join-Path $ToolkitRoot 'Toolkit-GUI.ps1') -Content $GuiContent -Encoding Utf8Bom
+
 # ---------- Launcher.bat ----------
 $LauncherContent = @'
 @echo off
 setlocal EnableExtensions
-title IT HELPDESK TOOLKIT v5 - MASTER LAUNCHER
+title IT HELPDESK TOOLKIT - GUI
 color 0B
 set "ROOT=%~dp0"
+if /i "%~1"=="--console" goto MAIN
+PowerShell.exe -NoProfile -ExecutionPolicy Bypass -STA -File "%ROOT%Toolkit-GUI.ps1"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] No se pudo iniciar la interfaz grafica.
+    pause
+    exit /b 1
+)
+exit /b 0
 
+:MAIN
+title IT HELPDESK TOOLKIT v6 - CONSOLA
 fltmc >nul 2>&1
 if errorlevel 1 (set "ADMIN=NO") else (set "ADMIN=SI")
 
 :MAIN
 cls
 echo =======================================================================
-echo                 IT HELPDESK TOOLKIT v5 - PRO EDITION
+echo                 IT HELPDESK TOOLKIT v6 - PRO EDITION
 echo                 Administrador: %ADMIN%
 echo =======================================================================
 echo.
@@ -1008,6 +1623,7 @@ echo  [05] Solucion de problemas del PC (Fix-Windows y Sysinternals)
 echo  [06] Diagnostico de red
 echo  [07] Auditoria e inventario
 echo  [08] Desinstalar y dejar como nuevo
+echo  [09] Power-Tune (energia y CPU)
 echo.
 echo  [99] SALIR
 echo =======================================================================
@@ -1027,6 +1643,7 @@ if "%choice%"=="05" goto M05
 if "%choice%"=="06" goto M06
 if "%choice%"=="07" goto M07
 if "%choice%"=="08" goto M08
+if "%choice%"=="09" goto M09
 if "%choice%"=="99" exit /b 0
 goto MAIN
 
@@ -1044,6 +1661,7 @@ if "%mn%"=="05" set "MD=05_PC_Troubleshooting"
 if "%mn%"=="06" set "MD=06_Network_Repair"
 if "%mn%"=="07" set "MD=07_Audit_Inventory"
 if "%mn%"=="08" set "MD=08_Uninstall_Reset"
+if "%mn%"=="09" set "MD=09_Power_Tune"
 if not defined MD goto MAIN
 call :RUN_MAN "%ROOT%%MD%\MANUAL.txt"
 goto MAIN
@@ -1057,10 +1675,14 @@ call :RUN "%ROOT%00_Remote\RustDesk_Portable.exe"
 goto MAIN
 
 :M01
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%Toolkit-SafetyCheck.ps1" -Operation "Instalar WireGuard"
+if errorlevel 1 goto MAIN
 call :RUN "%ROOT%01_VPN\WireGuard_Setup.msi"
 goto MAIN
 
 :M02
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%Toolkit-SafetyCheck.ps1" -Operation "Iniciar WAU Manager"
+if errorlevel 1 goto MAIN
 call :RUN "%ROOT%02_Updates\WAU_Manager.exe"
 goto MAIN
 
@@ -1101,12 +1723,19 @@ echo  05 - SOLUCION DE PROBLEMAS DEL PC
 echo.
 echo  [A] Fix-Windows - reparacion y mantenimiento de Windows (pide Administrador)
 echo  [B] Sysinternals - herramientas de diagnostico avanzado
+echo  [C] Optimizacion de Windows (pide Administrador)
 echo  [X] Volver
-choice /c ABX /n /m "Opcion: "
-if errorlevel 3 goto MAIN
+choice /c ABCX /n /m "Opcion: "
+if errorlevel 4 goto MAIN
+if errorlevel 3 goto M05C
 if errorlevel 2 goto M05B
 if "%ADMIN%"=="SI" goto M05A_RUN
 PowerShell -NoProfile -Command "Start-Process -FilePath '%ROOT%05_PC_Troubleshooting\Fix-Windows.bat' -Verb RunAs"
+goto MAIN
+
+:M05C
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%05_PC_Troubleshooting\Optimize-Windows.ps1"
+pause
 goto MAIN
 
 :M05A_RUN
@@ -1180,7 +1809,21 @@ pause
 goto M05B
 
 :M06
+cls
+echo  06 - DIAGNOSTICO Y OPTIMIZACION DE RED
+echo.
+echo  [A] Diagnosticar conectividad (solo lectura)
+echo  [B] Optimizar TCP y vaciar cache DNS (pide Administrador)
+echo  [X] Volver
+choice /c ABX /n /m "Opcion: "
+if errorlevel 3 goto MAIN
+if errorlevel 2 goto M06B
 PowerShell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%06_Network_Repair\Network-Diagnostics.ps1"
+pause
+goto MAIN
+
+:M06B
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%06_Network_Repair\Optimize-TCP.ps1"
 pause
 goto MAIN
 
@@ -1219,6 +1862,11 @@ goto MAIN
 :M08_RUN
 PowerShell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%08_Uninstall_Reset\Uninstall-Toolkit.ps1"
 if errorlevel 10 exit
+goto MAIN
+
+:M09
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%09_Power_Tune\Power-Tune.ps1"
+pause
 goto MAIN
 
 rem =======================================================================
@@ -1279,30 +1927,32 @@ exit /b 1
 '@
 Write-TextFile -Path (Join-Path $ToolkitRoot 'Launcher.bat') -Content $LauncherContent -Encoding Ascii
 
-Write-Status ' -> Launcher, Fix-Windows, inventario, diagnostico de red, verificador y modulo 08 listos.' 'Ok'
+Write-Status ' -> GUI, Launcher, scripts de soporte, optimizacion y modulo 08 listos.' 'Ok'
 
 # ----------------------------------------------------------------------
 # MANUALES (uno por modulo + manual general + guia de Sysinternals)
-# En el Launcher: M + numero (ej: M03). Solo M = manual general.
+# En el modo de consola: M + numero (ej: M03). Solo M = manual general.
 # ----------------------------------------------------------------------
 Write-Status ' -> Generando manuales...' 'Warn'
 
 $ManualGeneral = @'
 ================================================================
- IT HELPDESK TOOLKIT v5 - MANUAL GENERAL
+ IT HELPDESK TOOLKIT v6 - MANUAL GENERAL
 ================================================================
 
 QUÉ ES
 Un maletín portátil de herramientas para soporte técnico (helpdesk).
 Reúne en una sola carpeta: acceso remoto, VPN, antivirus bajo demanda,
 reparación de Windows, diagnóstico de red, inventario y desinstalación.
-Todo se maneja desde Launcher.bat.
+La interfaz principal es la GUI WPF de Launcher.bat.
 
 CÓMO EMPEZAR
- 1. Abre Launcher.bat. Para reparar Windows o usar el módulo 08,
-    hazlo con clic derecho > "Ejecutar como administrador".
- 2. Escribe el número del módulo y pulsa Enter.
- 3. MANUAL (como el comando "man"): escribe M + número del módulo.
+ 1. Abre Launcher.bat; la GUI solicita elevación de Administrador para
+    habilitar las operaciones de soporte y muestra los módulos a la izquierda.
+ 2. Elige un módulo y pulsa la acción correspondiente. Las opciones de cambio
+    del sistema piden confirmación antes de ejecutarse.
+ 3. Para usar la interfaz de consola anterior, ejecuta Launcher.bat --console.
+ 4. En la consola, escribe M + número del módulo para abrir su manual.
       M03  -> manual del antivirus        M05  -> manual de reparación
       M    -> este manual general
     Además, cada carpeta tiene su propio MANUAL.txt.
@@ -1313,10 +1963,18 @@ MÓDULOS
  02 Windows Update ......... WAU Manager: control de actualizaciones
  03 Antivirus .............. KVRT: escáner de Kaspersky bajo demanda
  04 Actualizador de apps ... UniGetUI: actualiza programas desde un solo sitio
- 05 Solución de problemas .. Fix-Windows (reparación) y Sysinternals (diagnóstico)
- 06 Diagnóstico de red ..... prueba la conexión capa por capa
+ 05 Solución de problemas .. Fix-Windows, optimización de Windows y Sysinternals
+ 06 Diagnóstico de red ..... diagnóstico y optimización básica TCP
  07 Auditoría e inventario . informe de hardware/SO y claves de Windows
  08 Desinstalar y reset .... deja el PC y el toolkit "como nuevos"
+ 09 Power-Tune ............. plan Ultimate Performance y Core Parking
+
+SEGURIDAD DE CAMBIOS
+ Antes de cambiar servicios, registro, TCP, energía, reparación o limpieza del
+ sistema, el toolkit intenta crear el punto
+ "Pre-Optimization-IT-Toolkit". Si falla, muestra el motivo y no continúa
+ hasta que el técnico autorice explícitamente seguir sin punto de restauración.
+ Las operaciones también quedan registradas en 05_PC_Troubleshooting\Logs.
 
 CONCEPTOS BÁSICOS
  Portable ........ se ejecuta sin instalarse (RustDesk, KVRT, Sysinternals...).
@@ -1324,7 +1982,9 @@ CONCEPTOS BÁSICOS
  Administrador .. permisos elevados; necesarios para reparar el sistema.
 
 ARCHIVOS DE LA CARPETA PRINCIPAL
- Launcher.bat ............ menú principal
+ Launcher.bat ............ inicia la GUI (consola disponible con --console)
+ Toolkit-GUI.ps1 ......... interfaz WPF en tema oscuro
+ Toolkit-SystemChange.psm1 control de confirmación, punto y logs
  Verify-Integrity.ps1 .... comprueba que ningún archivo cambió desde el despliegue
  INTEGRITY.txt ........... huellas SHA256 de los ejecutables y scripts
 
@@ -1431,6 +2091,8 @@ PRECAUCIONES
  - WAU Manager puede DESACTIVAR el servicio de Windows Update. Un equipo
    sin parches de seguridad es un riesgo. No lo uses en equipos que no
    administras ni dejes el servicio desactivado indefinidamente.
+ - Antes de abrirlo desde el toolkit, se solicita confirmación y se intenta
+   crear el punto de restauración obligatorio.
  - Si lo desactivaste, puedes volver al estado normal con el módulo 08,
    opción 3 (revierte servicio, directiva y tareas programadas de WAU Manager).
  - Si creó un acceso directo en el escritorio, bórralo a mano.
@@ -1505,13 +2167,16 @@ $Manual05 = @'
 ================================================================
  MANUAL - 05 SOLUCIÓN DE PROBLEMAS DEL PC
 ================================================================
-Contiene dos partes:  A) Fix-Windows.bat   B) Sysinternals
+Contiene tres partes: A) Fix-Windows.bat   B) Sysinternals   C) Optimize-Windows.ps1
 
 ----------------------------------------------------------------
  A) FIX-WINDOWS.BAT  -  menú de reparación de Windows
 ----------------------------------------------------------------
 Requiere Administrador. Cada sesión guarda un log en la carpeta Logs.
 Pulsa M dentro del menú para abrir este manual.
+Antes de las opciones que modifican el sistema, pide confirmación e intenta
+crear el punto de restauración del toolkit. Si falla, el técnico debe autorizar
+explícitamente continuar.
 
 [1] Mantenimiento y limpieza del SO
     Qué hace: borra temporales del usuario y del sistema y vacía la papelera.
@@ -1545,9 +2210,6 @@ Pulsa M dentro del menú para abrir este manual.
 
 [6] Mantenimiento completo = 1 + 2 + 3 + 5   (no incluye la 4)
 
-Qué NO se puede deshacer: lo hecho por las opciones 4 y 5 (limpieza de red
-y de Windows Update). Las demás no dejan cambios que revertir.
-
 ----------------------------------------------------------------
  B) SYSINTERNALS  -  diagnóstico avanzado de Microsoft
 ----------------------------------------------------------------
@@ -1556,6 +2218,19 @@ hace realmente Windows. En la carpeta Sysinternals solo están las
 IMPORTANTES (versión 64 bits); el resto está en la subcarpeta _Otras.
 Desde el Launcher (05 > B) cada herramienta aparece con su descripción.
 Guía completa con ejemplos: Sysinternals\GUIA_SYSINTERNALS.txt
+
+----------------------------------------------------------------
+ C) OPTIMIZAR WINDOWS
+----------------------------------------------------------------
+Desde la GUI, opción 05 > "Optimizar Windows". Cambia DiagTrack, WerSvc y
+MapsBroker a Disabled; SysMain, WSearch y Spooler a Manual. Ajusta
+SystemResponsiveness, NetworkThrottlingIndex y los valores de la tarea Games
+en Multimedia\SystemProfile. Requiere Administrador y crea/loguea el punto
+de restauración antes de aplicar cambios. Desactivar Spooler puede impedir
+imprimir; poner WSearch en Manual puede afectar la indexación.
+
+Las optimizaciones no se revierten automáticamente desde el módulo 08:
+revisa los cambios con el técnico y restablece los valores que correspondan.
 '@
 Write-TextFile -Path (Join-Path $ToolkitRoot '05_PC_Troubleshooting/MANUAL.txt') -Content $Manual05 -Encoding Utf8Bom
 
@@ -1586,7 +2261,15 @@ QUÉ COMPRUEBA (en este orden)
 Al final muestra un diagnóstico en una frase.
 
 CÓMO SE USA
- Opción 06 del Launcher. No necesita Administrador.
+ Opción 06 de la GUI o Launcher.bat --console. El diagnóstico no requiere
+ Administrador. "Optimizar TCP y vaciar DNS" sí requiere Administrador,
+ confirmación y un punto de restauración antes de cambiar nada.
+
+OPTIMIZACIÓN TCP
+ Ajusta autotuning a normal, desactiva ECN y timestamps, configura cubic
+ (con fallback a supplemental custom si la sintaxis global no está disponible)
+ y vacía la caché DNS. El cambio puede afectar el comportamiento de red;
+ consulta el log del toolkit.
 
 SI HAY PROBLEMAS, QUÉ HACER
  - DNS o web fallando: Fix-Windows opción 3 (módulo 05).
@@ -1634,6 +2317,8 @@ QUÉ ES
 Un asistente que quita lo que el toolkit dejó en el equipo y puede devolver
 el propio toolkit a su estado inicial. CADA PASO MUESTRA lo que encontró y
 PIDE CONFIRMACIÓN antes de borrar nada.
+Las modificaciones de Windows pasan además por el control de punto de
+restauración; el reset del toolkit conserva la GUI, sus scripts y manuales.
 
 CÓMO SE USA
  Abre Launcher.bat como Administrador y elige 08.
@@ -1654,20 +2339,50 @@ OPCIONES
      una directiva o creó tareas programadas, lo detecta y lo restablece.
      (En equipos de una empresa, la directiva puede ser de tu administrador.)
  [4] Resetear el toolkit ...... borra las herramientas descargadas, los
-     informes de inventario y los logs. Conserva Launcher, scripts y
+     informes de inventario y los logs. Conserva GUI, Launcher, scripts y
      manuales. Para volver a descargar todo: Deploy-IT-Toolkit.ps1.
  [5] Eliminar el toolkit COMPLETO  borra la carpeta entera. Exige escribir
      ELIMINAR para confirmar.
  [6] TODO = 1 + 2 + 3 + 4 ..... deja el equipo y el toolkit como nuevos.
 
 LO QUE NO SE PUEDE REVERTIR
- Los cambios de Fix-Windows en la red (opción 4) y el historial de Windows
- Update no se pueden restaurar: el módulo 08 no los toca.
+ El punto de restauración no revierte todos los tipos de cambio de Windows.
+ Las optimizaciones de servicios/registro, TCP y energía no se revierten
+ automáticamente; restablece manualmente los valores adecuados al equipo.
 
 CONSEJO
  Si no estás seguro, empieza por [2] y [3]: solo listan y preguntan.
 '@
 Write-TextFile -Path (Join-Path $ToolkitRoot '08_Uninstall_Reset/MANUAL.txt') -Content $Manual08 -Encoding Utf8Bom
+
+$Manual09 = @'
+================================================================
+ MANUAL - 09 POWER-TUNE (ENERGÍA Y CPU)
+================================================================
+
+QUÉ HACE
+ 1. Duplica el esquema Ultimate Performance integrado en Windows y activa el
+    GUID que devuelve Windows.
+ 2. Configura CPMINCORES a 100% en corriente alterna para desactivar Core
+    Parking en AC y reactiva el esquema actual.
+
+CÓMO SE USA
+ En la GUI, selecciona 09 > "Aplicar ajuste de energía". Requiere Administrador.
+ Antes de cambiar el sistema solicita confirmación y ejecuta el intento
+ obligatorio de crear "Pre-Optimization-IT-Toolkit".
+
+PRECAUCIONES
+ - Puede aumentar el consumo, temperatura y ruido del equipo, especialmente
+   en laptops. No se recomienda cuando se prioriza batería o refrigeración.
+ - Si falla la creación del punto de restauración, la interfaz explica el
+   error y pide autorización explícita para continuar sin él.
+ - El módulo 08 no revierte automáticamente el plan ni Core Parking.
+
+REGISTRO
+ El resultado y los errores se escriben en
+ 05_PC_Troubleshooting\Logs\IT-Toolkit_<fecha>.log.
+'@
+Write-TextFile -Path (Join-Path $ToolkitRoot '09_Power_Tune/MANUAL.txt') -Content $Manual09 -Encoding Utf8Bom
 
 $SysGuideContent = @'
 ================================================================
@@ -1769,7 +2484,7 @@ documentación oficial de Microsoft para cada una.
 '@
 Write-TextFile -Path (Join-Path $ToolkitRoot '05_PC_Troubleshooting/Sysinternals/GUIA_SYSINTERNALS.txt') -Content $SysGuideContent -Encoding Utf8Bom
 
-Write-Status ' -> Manuales listos (general + 00 a 08 + guia de Sysinternals).' 'Ok'
+Write-Status ' -> Manuales listos (general + 00 a 09 + guia de Sysinternals).' 'Ok'
 # ----------------------------------------------------------------------
 # 3. DESCARGAS
 # ----------------------------------------------------------------------
@@ -1870,10 +2585,10 @@ Write-Status "`n[4/4] Generando registro de integridad SHA256..." 'Warn'
 
 
 $integrity = New-Object System.Collections.Generic.List[string]
-$integrity.Add('# IT Helpdesk Toolkit v4 - Registro de integridad (SHA256)')
+$integrity.Add('# IT Helpdesk Toolkit v6 - Registro de integridad (SHA256)')
 $integrity.Add("# Generado: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') en $($env:COMPUTERNAME)")
 $integrity.Add('# Formato: HASH<2 espacios>ruta relativa. Verificar con Verify-Integrity.ps1')
-$hashExt = @('.exe', '.msi', '.bat', '.ps1')
+$hashExt = @('.exe', '.msi', '.bat', '.ps1', '.psm1')
 Get-ChildItem -Path $ToolkitRoot -Recurse -File |
     Where-Object { $hashExt -contains $_.Extension.ToLowerInvariant() } |
     Sort-Object FullName |
@@ -1899,6 +2614,6 @@ if ($script:Results.Count -gt 0) {
 }
 
 Write-Status "`n=======================================================================" 'Step'
-Write-Status '    TOOLKIT v5 DESPLEGADO' 'Step'
+Write-Status '    TOOLKIT v6 DESPLEGADO' 'Step'
 Write-Status "    Ubicacion: $ToolkitRoot" 'Step'
 Write-Status '=======================================================================' 'Step'
